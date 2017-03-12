@@ -34,5 +34,5 @@ struct gic_kvm_info {
 };
 
 const struct gic_kvm_info *gic_get_kvm_info(void);
-
+void __init early_init_gic_its(void);
 #endif /* __LINUX_IRQCHIP_ARM_GIC_COMMON_H */

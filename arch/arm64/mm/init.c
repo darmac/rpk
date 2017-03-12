@@ -40,6 +40,7 @@
 #include <linux/mm.h>
 #include <linux/kexec.h>
 #include <linux/crash_dump.h>
+#include <linux/irqchip/arm-gic-common.h>
 
 #include <asm/boot.h>
 #include <asm/fixmap.h>
@@ -468,6 +469,7 @@ void __init arm64_memblock_init(void)
 #endif
 
 	early_init_fdt_scan_reserved_mem();
+	early_init_gic_its();
 
 	/* 4GB maximum for 32-bit only capable devices */
 	if (IS_ENABLED(CONFIG_ZONE_DMA32))

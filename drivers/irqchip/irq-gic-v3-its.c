@@ -33,6 +33,7 @@
 #include <linux/of_platform.h>
 #include <linux/percpu.h>
 #include <linux/slab.h>
+#include <linux/memblock.h>
 
 #include <linux/irqchip.h>
 #include <linux/irqchip/arm-gic-v3.h>
@@ -40,6 +41,7 @@
 
 #include <asm/cputype.h>
 #include <asm/exception.h>
+#include <asm/early_ioremap.h>
 
 #include "irq-gic-common.h"
 
@@ -159,6 +161,7 @@ static LIST_HEAD(its_nodes);
 static DEFINE_SPINLOCK(its_lock);
 static struct rdists *gic_rdists;
 static struct irq_domain *its_parent;
+static phys_addr_t its_prop_phys;
 
 static unsigned long its_list_map;
 static u16 vmovp_seq_num;
@@ -1538,6 +1541,13 @@ static int __init its_alloc_lpi_tables(void)
 {
 	phys_addr_t paddr;
 
+	if (its_prop_phys) {
+		gic_rdists->prop_page = phys_to_page(its_prop_phys);
+		gic_flush_dcache_to_poc(page_address(gic_rdists->prop_page),
+					LPI_PROPBASE_SZ);
+		goto reuse_prop_page;
+	}
+
 	lpi_id_bits = min_t(u32, gic_rdists->id_bits, ITS_MAX_LPI_NRBITS);
 	gic_rdists->prop_page = its_allocate_prop_table(GFP_NOWAIT);
 	if (!gic_rdists->prop_page) {
@@ -1545,6 +1555,7 @@ static int __init its_alloc_lpi_tables(void)
 		return -ENOMEM;
 	}
 
+reuse_prop_page:
 	paddr = page_to_phys(gic_rdists->prop_page);
 	pr_info("GIC: using LPI property table @%pa\n", &paddr);
 
@@ -1862,6 +1873,19 @@ static void its_cpu_init_lpis(void)
 	if (!pend_page) {
 		phys_addr_t paddr;
 
+		if (its_prop_phys) {
+			paddr = readq_relaxed(rbase + GICR_PENDBASER);
+			val = readl_relaxed(rbase + GICR_CTLR);
+			if (val & GICR_CTLR_ENABLE_LPIS) {
+				paddr &= GENMASK(51, 16);
+				pend_page = phys_to_page(paddr);
+				memset(page_address(pend_page), 0, SZ_64K);
+				gic_flush_dcache_to_poc(page_address(pend_page),
+							LPI_PENDBASE_SZ);
+				goto reuse_pend_page;
+			}
+		}
+
 		pend_page = its_allocate_pending_table(GFP_NOWAIT);
 		if (!pend_page) {
 			pr_err("Failed to allocate PENDBASE for CPU%d\n",
@@ -1869,6 +1893,7 @@ static void its_cpu_init_lpis(void)
 			return;
 		}
 
+reuse_pend_page:
 		paddr = page_to_phys(pend_page);
 		pr_info("CPU%d: using LPI pending table @%pa\n",
 			smp_processor_id(), &paddr);
@@ -3518,3 +3543,256 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 
 	return 0;
 }
+
+#ifdef CONFIG_ACPI
+/* Checksum function */
+static u8 its_acpi_csum(u8 *data, u32 len)
+{
+	u8 csum = 0;
+
+	while (len)
+		csum += data[--len];
+
+	return csum;
+}
+
+static __init struct acpi_table_madt *early_get_madt_table(void)
+{
+	struct acpi_table_madt *madt = NULL;
+	struct acpi_table_xsdt *xsdt = NULL;
+	struct acpi_table_header *table;
+	struct acpi_table_rsdp *rsdp;
+	char sign[ACPI_NAME_SIZE];
+	u32 count, length;
+	phys_addr_t addr;
+
+	addr = acpi_os_get_root_pointer();
+	if (!addr)
+		return madt;
+
+	/* Parse RSDP table */
+	rsdp = early_memremap(addr, sizeof(*rsdp));
+	if (!rsdp) {
+		pr_err("ITS: failed to memremap RSDP table\n");
+		return madt;
+	}
+	if (its_acpi_csum(ACPI_CAST_PTR(u8, rsdp), rsdp->length)) {
+		pr_err("ITS: incorrect checksum in RSDP table\n");
+		goto rsdp_memunmap;
+	}
+
+	/* Support only 64bit entry XSDT table */
+	addr = rsdp->xsdt_physical_address;
+	if ((rsdp->revision < 1) || (!addr)) {
+		pr_err("ITS: unexpected RSDP revision and xsdt address\n");
+		goto rsdp_memunmap;
+	}
+
+	/* Parse XSDT table, simple validation check on XSDT size */
+	table = early_memremap(addr, sizeof(*table));
+	if (table) {
+		length = table->length;
+		early_memunmap(table, sizeof(*table));
+		if (length > sizeof(struct acpi_table_xsdt))
+			xsdt = early_memremap(addr, length);
+	}
+
+	if (!xsdt) {
+		pr_err("ITS: failed to memremap XSDT table\n");
+		goto rsdp_memunmap;
+	}
+
+	if (its_acpi_csum(ACPI_CAST_PTR(u8, xsdt), xsdt->header.length)) {
+		pr_err("ITS: incorrect checksum in XSDT table\n");
+		goto xsdt_memunmap;
+	}
+
+	count = (xsdt->header.length - sizeof(struct acpi_table_header)) /
+		ACPI_XSDT_ENTRY_SIZE;
+
+	/* Parse ACPI tables till we find the table which has signature APIC */
+	while (count) {
+		addr = xsdt->table_offset_entry[--count];
+		table  = early_memremap(addr, sizeof(*table));
+		if (!table) {
+			pr_err("ITS: failed to memremap XSDT entry\n");
+			break;
+		}
+
+		memcpy(sign, table->signature, ACPI_NAME_SIZE);
+		length = table->length;
+		early_memunmap(table, sizeof(*table));
+
+		/* Check MADT signature */
+		if (!memcmp(sign, ACPI_SIG_MADT, strlen(ACPI_SIG_MADT))) {
+			madt = early_memremap(addr, length);
+			if (!madt)
+				pr_err("ITS: failed to memremap MADT\n");
+			break;
+		}
+	}
+
+xsdt_memunmap:
+	early_memunmap(xsdt, xsdt->header.length);
+rsdp_memunmap:
+	early_memunmap(rsdp, sizeof(*rsdp));
+	return madt;
+}
+
+typedef int (*madt_handler)(struct acpi_subtable_header *header, u32 *val);
+
+static int __init early_madt_iterator(struct acpi_table_madt *madt, u8 type,
+				      madt_handler handler, u32 *val)
+{
+	struct acpi_subtable_header *table;
+	void *endptr, *ptr;
+	int ret, count = 0;
+
+	ptr = ACPI_ADD_PTR(void, madt, sizeof(struct acpi_table_madt));
+	endptr = ACPI_ADD_PTR(void, madt, madt->header.length);
+
+	while (ptr < endptr) {
+		table = ACPI_CAST_PTR(struct acpi_subtable_header, ptr);
+		ptr = ACPI_ADD_PTR(void, ptr, table->length);
+		if (table->type != type)
+			continue;
+
+		ret = handler(table, val);
+		if (ret < 0)
+			return ret;
+		count++;
+	}
+
+	return count;
+}
+
+/* Return GICD IIDR value */
+static int __init early_madt_gicd(struct acpi_subtable_header *table, u32 *val)
+{
+	struct acpi_madt_generic_distributor *dist;
+	void __iomem *base;
+	u32 iidr;
+
+	dist = ACPI_CAST_PTR(struct acpi_madt_generic_distributor, table);
+	base = early_ioremap(dist->base_address, SZ_4K);
+	if (!base) {
+		pr_err("ITS: failed to ioremap GICD sub table\n");
+		return -ENOMEM;
+	}
+	iidr = readl_relaxed(base + GICD_IIDR);
+	early_iounmap(base, SZ_4K);
+
+	if (val)
+		*val = iidr;
+
+	return 0;
+}
+
+/* Return memory mapped MADT table pointer on success else NULL */
+static int __init early_madt_gicc(struct acpi_subtable_header *table, u32 *val)
+{
+	struct acpi_madt_generic_interrupt *gicc;
+	phys_addr_t pend_phys, prop_phys;
+	u32 gicr_ctlr, nrbits, size;
+	u64 pendbaser, propbaser;
+	void __iomem *rbase;
+
+	/* Skip disabled GICC or with invalid redistributor address */
+	gicc = ACPI_CAST_PTR(struct acpi_madt_generic_interrupt, table);
+	if (!(gicc->flags & ACPI_MADT_ENABLED) || (!gicc->gicr_base_address))
+		return 0;
+
+	rbase = early_ioremap(gicc->gicr_base_address, SZ_64K);
+	if (!rbase) {
+		pr_err("ITS: failed to ioremap GICC sub table\n");
+		return -ENOMEM;
+	}
+
+	/* Read PEND/PROP base registers configuration */
+	pendbaser = readq_relaxed(rbase + GICR_PENDBASER);
+	propbaser = readq_relaxed(rbase + GICR_PROPBASER);
+	gicr_ctlr = readl_relaxed(rbase + GICR_CTLR);
+	early_iounmap(rbase, SZ_64K);
+
+	/* No need to reserve memory if LPI is in a disabled state */
+	if (!(gicr_ctlr & GICR_CTLR_ENABLE_LPIS))
+		return 0;
+
+	nrbits = (propbaser & GICR_PROPBASER_IDBITS_MASK) + 1;
+	pend_phys = pendbaser & GENMASK(51, 16);
+	prop_phys = propbaser & GENMASK(51, 12);
+
+	/**
+	 * Try to reuse the pending and property tables which were
+	 * programmed before loading this kernel. Use a memblock API
+	 * to reserve memory, it's not visible to Linux buddy memory
+	 * allocator.
+	 */
+	if ((!its_prop_phys) && prop_phys) {
+		its_prop_phys = prop_phys;
+		size = ALIGN(BIT(nrbits), SZ_64K);
+		lpi_id_bits = min_t(u32, nrbits, ITS_MAX_LPI_NRBITS);
+		/* Check if the pending table memory is included in memblock */
+		if (!memblock_is_memory(prop_phys)) {
+			if (memblock_add(prop_phys, size))
+				pr_crit("ITS: Failed to add prop memblock\n");
+		}
+		if (memblock_is_region_reserved(prop_phys, size)) {
+			pr_crit("ITS: Unable to reserve prop table memory\n");
+			return -EINVAL;
+		}
+		memblock_reserve(prop_phys, size);
+		pr_err("ITS: reserved prop table memory [%#016llx-%#016llx]\n",
+		       prop_phys, prop_phys + size - 1);
+	}
+
+	if (pend_phys) {
+		size = ALIGN(BIT(nrbits)/8, SZ_64K);
+		/* Check if the prop table memory is included in memblock */
+		if (!memblock_is_memory(pend_phys)) {
+			if (memblock_add(pend_phys, size))
+				pr_crit("ITS: Failed to add pend memblock\n");
+		}
+		if (memblock_is_region_reserved(pend_phys, size)) {
+			pr_crit("ITS: Unable to reserve pend table memory\n");
+			return -EINVAL;
+		}
+		memblock_reserve(pend_phys, size);
+		pr_err("ITS: reserved pend table memory [%#016llx-%#016llx]\n",
+		       pend_phys, pend_phys + size - 1);
+	}
+	return 0;
+}
+
+void __init early_init_gic_its(void)
+{
+	struct acpi_table_madt *madt;
+	u32 gicd_iidr;
+	int ret;
+
+	/* Find MADT table */
+	madt = early_get_madt_table();
+	if (!madt)
+		return;
+
+	/* Verify MADT table checksum */
+	if (its_acpi_csum(ACPI_CAST_PTR(u8, madt), madt->header.length)) {
+		pr_err("ITS: incorrect checksum in MADT table\n");
+		goto early_init_done;
+	}
+
+	/* Apply LPI reinit workaround to only QDF2400 ITS */
+	ret = early_madt_iterator(madt, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+				  early_madt_gicd, &gicd_iidr);
+	if ((ret < 0) || (gicd_iidr != 0x00001070))
+		goto early_init_done;
+
+	early_madt_iterator(madt, ACPI_MADT_TYPE_GENERIC_INTERRUPT,
+			    early_madt_gicc, NULL);
+
+early_init_done:
+	early_memunmap(madt, madt->header.length);
+}
+#else
+void __init early_init_gic_its(void) {}
+#endif
