@@ -179,6 +179,22 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 			   MIDR_CPU_VAR_REV(0, 0)),
 	},
 #endif
+#ifdef CONFIG_QCOM_FALKOR_ERRATUM_E1041
+	{
+		.desc = "Qualcomm Technologies Falkor erratum 1041",
+		.capability = ARM64_WORKAROUND_QCOM_FALKOR_E1041,
+		MIDR_RANGE(MIDR_QCOM_FALKOR_V1,
+			MIDR_CPU_VAR_REV(0, 0),
+			MIDR_CPU_VAR_REV(0, 0)),
+	},
+	{
+		.desc = "Qualcomm Technologies Falkor erratum 1041",
+		.capability = ARM64_WORKAROUND_QCOM_FALKOR_E1041,
+		MIDR_RANGE(MIDR_QCOM_FALKOR,
+			MIDR_CPU_VAR_REV(0, 1),
+			MIDR_CPU_VAR_REV(0, 2)),
+	},
+#endif
 #ifdef CONFIG_ARM64_ERRATUM_858921
 	{
 	/* Cortex-A73 all versions */
