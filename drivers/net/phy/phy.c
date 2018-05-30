@@ -651,8 +651,9 @@ static irqreturn_t phy_change(struct phy_device *phydev)
 		    !phydev->drv->did_interrupt(phydev))
 			return IRQ_NONE;
 
-		if (phy_disable_interrupts(phydev))
-			goto phy_err;
+		if (phydev->state == PHY_HALTED)
+			if (phy_disable_interrupts(phydev))
+				goto phy_err;
 	}
 
 	mutex_lock(&phydev->lock);
@@ -660,15 +661,11 @@ static irqreturn_t phy_change(struct phy_device *phydev)
 		phydev->state = PHY_CHANGELINK;
 	mutex_unlock(&phydev->lock);
 
-	if (phy_interrupt_is_valid(phydev)) {
-		/* Reenable interrupts */
-		if (PHY_HALTED != phydev->state &&
-		    phy_config_interrupt(phydev, PHY_INTERRUPT_ENABLED))
-			goto phy_err;
-	}
-
 	/* reschedule state queue work to run as soon as possible */
 	phy_trigger_machine(phydev, true);
+
+	if (phy_interrupt_is_valid(phydev) && phy_clear_interrupt(phydev))
+		goto phy_err;
 	return IRQ_HANDLED;
 
 phy_err:
@@ -980,10 +977,6 @@ void phy_state_machine(struct work_struct *work)
 			phydev->state = PHY_NOLINK;
 			phy_link_down(phydev, true);
 		}
-
-		if (phy_interrupt_is_valid(phydev))
-			err = phy_config_interrupt(phydev,
-						   PHY_INTERRUPT_ENABLED);
 		break;
 	case PHY_HALTED:
 		if (phydev->link) {
